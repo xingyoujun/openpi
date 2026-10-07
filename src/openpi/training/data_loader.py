@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import signal
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -127,28 +128,112 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+class _NoVideoLeRobotDataset(lerobot_dataset.LeRobotDataset):
+    """LeRobotDataset that returns tiny dummy frames instead of decoding videos (for state/action-only uses)."""
+
+    def _query_videos(self, query_timestamps, ep_idx):
+        del ep_idx
+        return {key: torch.zeros(3, 8, 8) for key in query_timestamps}
+
+
+def _create_lerobot_dataset(
+    repo_id: str,
+    *,
+    root: str | None,
+    episodes: Sequence[int] | None,
+    prompt: str | None,
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    decode_video: bool = True,
 ) -> Dataset:
-    """Create a dataset for training."""
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+    dataset_cls = lerobot_dataset.LeRobotDataset if decode_video else _NoVideoLeRobotDataset
+    dataset = dataset_cls(
+        repo_id,
+        root=root,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
+
+    if episodes is not None:
+        # Select episodes by frame range instead of LeRobotDataset(episodes=...): the latter mis-indexes
+        # `episode_data_index` unless the selection is a prefix [0..N), and this also keeps action chunks
+        # from reading past the end of an episode.
+        starts, ends = dataset.episode_data_index["from"], dataset.episode_data_index["to"]
+        frame_indices = [i for e in episodes for i in range(int(starts[e]), int(ends[e]))]
+        dataset = torch.utils.data.Subset(dataset, frame_indices)
+
+    if prompt is not None:
+        dataset = TransformedDataset(dataset, [_transforms.FixedPrompt(prompt)])
+    elif data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    return dataset
+
+
+def _create_combined_dataset(
+    data_config: _config.DataConfig, action_horizon: int, *, decode_video: bool = True
+) -> Dataset:
+    """Concatenates several LeRobot datasets, each with its own episode selection, prompt and repeat count."""
+    parts = []
+    fps = None
+    for sub in data_config.sub_datasets:
+        meta = lerobot_dataset.LeRobotDatasetMetadata(sub.repo_id, root=sub.root)
+        if fps is not None and meta.fps != fps:
+            raise ValueError(f"All sub-datasets must share the same fps, got {meta.fps} for {sub.repo_id} vs {fps}.")
+        fps = meta.fps
+
+        if sub.episodes is not None:
+            episodes = list(sub.episodes)
+        elif sub.num_episodes is not None:
+            if sub.num_episodes > meta.total_episodes:
+                raise ValueError(f"{sub.repo_id} has {meta.total_episodes} episodes, requested {sub.num_episodes}.")
+            episodes = list(range(sub.num_episodes))
+        else:
+            episodes = None
+        if episodes is not None and not all(0 <= e < meta.total_episodes for e in episodes):
+            raise ValueError(f"Episode indices out of range for {sub.repo_id} ({meta.total_episodes} episodes).")
+
+        dataset = _create_lerobot_dataset(
+            sub.repo_id,
+            root=sub.root,
+            episodes=episodes,
+            prompt=sub.prompt,
+            data_config=data_config,
+            action_horizon=action_horizon,
+            decode_video=decode_video,
+        )
+        logging.info(f"Sub-dataset {sub.repo_id}: {len(dataset)} frames, x{sub.repeat}")
+        parts.extend([dataset] * sub.repeat)
+    return torch.utils.data.ConcatDataset(parts)
+
+
+def create_torch_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    decode_video: bool = True,
+) -> Dataset:
+    """Create a dataset for training. With `decode_video=False` images are dummy tensors (e.g. for norm stats)."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+    if data_config.sub_datasets:
+        return _create_combined_dataset(data_config, action_horizon, decode_video=decode_video)
+
+    return _create_lerobot_dataset(
+        repo_id,
+        root=None,
+        episodes=None,
+        prompt=None,
+        data_config=data_config,
+        action_horizon=action_horizon,
+        decode_video=decode_video,
     )
-
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
-    return dataset
 
 
 def create_rlds_dataset(
@@ -481,6 +566,10 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # Job-level signals (Slurm preemption / time-limit warning) reach every process of the step. Only the main
+    # process handles them (to save a checkpoint); workers must survive until the main process shuts them down.
+    for sig in (signal.SIGTERM, signal.SIGUSR1):
+        signal.signal(sig, signal.SIG_IGN)
 
 
 class RLDSDataLoader:

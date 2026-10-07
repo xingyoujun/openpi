@@ -325,6 +325,16 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class FixedPrompt(DataTransformFn):
+    """Sets the same prompt on every sample."""
+
+    prompt: str
+
+    def __call__(self, data: DataDict) -> DataDict:
+        return {**data, "prompt": self.prompt}
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

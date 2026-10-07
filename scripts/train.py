@@ -2,6 +2,8 @@ import dataclasses
 import functools
 import logging
 import platform
+import signal
+import sys
 from typing import Any
 
 import etils.epath as epath
@@ -26,6 +28,24 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+
+# Exit code used after saving a checkpoint because of a preemption / time-limit signal, so that the launcher
+# script knows the job should be requeued (see scripts/slurm/train_backfill.sbatch).
+PREEMPT_EXIT_CODE = 85
+_stop_signal: int | None = None
+
+
+def _install_stop_signal_handlers():
+    """On SIGTERM (Slurm preemption) or SIGUSR1 (time-limit warning) request a checkpoint-and-exit."""
+
+    def handler(signum, frame):
+        del frame
+        global _stop_signal
+        _stop_signal = signum
+
+    for sig in (signal.SIGTERM, signal.SIGUSR1):
+        signal.signal(sig, handler)
 
 
 def init_logging():
@@ -214,6 +234,7 @@ def main(config: _config.TrainConfig):
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        max_to_keep=config.max_to_keep,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
@@ -255,6 +276,7 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    _install_stop_signal_handlers()
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
@@ -269,8 +291,18 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
+        saved = False
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            saved = True
+
+        if _stop_signal is not None and step < config.num_train_steps - 1:
+            logging.warning(f"Received signal {_stop_signal}; saving checkpoint at step {step} and exiting.")
+            if not saved and step > start_step:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            checkpoint_manager.wait_until_finished()
+            wandb.finish()
+            sys.exit(PREEMPT_EXIT_CODE)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

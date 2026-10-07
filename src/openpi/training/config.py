@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.pine_policy as pine_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -62,6 +63,25 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SubDataset:
+    """One LeRobot dataset to be mixed into a combined training set (see `DataConfig.sub_datasets`)."""
+
+    # LeRobot repo id, resolved as `$HF_LEROBOT_HOME/<repo_id>` when `root` is not given.
+    repo_id: str
+    # Local dataset root. Overrides the `$HF_LEROBOT_HOME/<repo_id>` lookup.
+    root: str | None = None
+    # Use only the first N episodes of this dataset. None means all episodes.
+    num_episodes: int | None = None
+    # Explicit episode indices to use. Takes precedence over `num_episodes`.
+    episodes: Sequence[int] | None = None
+    # Overrides the prompt for every sample of this dataset. If None, the prompt comes from the dataset's own
+    # tasks (when `prompt_from_task` is set).
+    prompt: str | None = None
+    # Number of times this dataset is repeated, to oversample it relative to the others.
+    repeat: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -89,6 +109,10 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # If non-empty, the training set is the concatenation of these LeRobot datasets instead of a single `repo_id`.
+    # `repo_id` is then only a name for the combination: it is where the norm stats / assets are stored.
+    sub_datasets: Sequence[SubDataset] = ()
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -167,6 +191,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Optional: build the training set from several LeRobot datasets (see `DataConfig.sub_datasets`).
+    sub_datasets: Sequence[SubDataset] = ()
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -182,6 +208,7 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            sub_datasets=self.sub_datasets,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -356,6 +383,56 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotPineDataConfig(DataConfigFactory):
+    """Pine UR7e + Robotiq datasets (e.g. pine_wm_real2sim_v0): eef_9d + gripper, three cameras.
+
+    The dataset keeps the eef pose (`*.eef_9d`) and the 7-D joint vector (last entry = gripper) in separate columns,
+    so the data loader reads both `action.eef_9d` and `action` as action sequences and `PineInputs` concatenates them
+    into a 10-D action. Actions are absolute, so the eef part is converted to deltas w.r.t. the current state (the
+    gripper stays absolute).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/ego_image": "observation.images.ego_view",
+                        "observation/wrist_a_image": "observation.images.wrist_a_view",
+                        "observation/wrist_b_image": "observation.images.wrist_b_view",
+                        "observation/eef_9d": "observation.eef_9d",
+                        "observation/gripper": "observation.state",
+                        "actions/eef_9d": "action.eef_9d",
+                        "actions/gripper": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[pine_policy.PineInputs(model_type=model_config.model_type)],
+            outputs=[pine_policy.PineOutputs()],
+        )
+        delta_action_mask = _transforms.make_bool_mask(9, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action.eef_9d", "action"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -516,6 +593,8 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Number of most recent checkpoints to keep (older ones are deleted, except those kept by `keep_period`).
+    max_to_keep: int = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -760,6 +839,71 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning on the Pine real2sim simulation data (UR7e + Robotiq, eef_9d + gripper, 3 cameras).
+    #
+    TrainConfig(
+        name="pi05_pine_sim3",
+        project_name="pine_wm",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotPineDataConfig(
+            repo_id="pine_wm_real2sim_v0_lr/sim3",
+            base_config=DataConfig(prompt_from_task=True),
+            sub_datasets=[
+                SubDataset("pine_wm_real2sim_v0_lr/stack_cubes"),
+                SubDataset("pine_wm_real2sim_v0_lr/ring_toss"),
+                SubDataset("pine_wm_real2sim_v0_lr/pour_tea"),
+            ],
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=20_000,
+        save_interval=1000,
+        keep_period=None,
+        max_to_keep=2,
+    ),
+    # Same as pi05_pine_sim3 but on the preprocessed (224x224 center-crop, all-intra) dataset; more loader workers.
+    TrainConfig(
+        name="pi05_pine_sim3_fast",
+        project_name="pine_wm",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotPineDataConfig(
+            repo_id="pine_wm_real2sim_v0_fast/sim3",
+            base_config=DataConfig(prompt_from_task=True),
+            sub_datasets=[
+                SubDataset("pine_wm_real2sim_v0_fast/stack_cubes"),
+                SubDataset("pine_wm_real2sim_v0_fast/ring_toss"),
+                SubDataset("pine_wm_real2sim_v0_fast/pour_tea"),
+            ],
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+        ),
+        num_workers=16,
+        num_train_steps=20_000,
+        save_interval=1000,
+        keep_period=None,
+        max_to_keep=2,
     ),
     #
     # Fine-tuning Aloha configs.
