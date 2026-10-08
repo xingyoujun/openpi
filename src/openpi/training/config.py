@@ -866,7 +866,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+            "/lustre/fsw/portfolios/coreai/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
         ),
         num_train_steps=20_000,
         save_interval=1000,
@@ -897,11 +897,47 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+            "/lustre/fsw/portfolios/coreai/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
         ),
         num_workers=16,
         num_train_steps=20_000,
         save_interval=1000,
+        keep_period=None,
+        max_to_keep=2,
+    ),
+    # All six tasks of pine_wm_real2sim_v0 (adds apples_green_then_red, apples_red_then_green, erase_whiteboard) on the
+    # preprocessed dataset.
+    TrainConfig(
+        name="pi05_pine_sim6_fast",
+        project_name="pine_wm",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotPineDataConfig(
+            repo_id="pine_wm_real2sim_v0_fast/sim6",
+            base_config=DataConfig(prompt_from_task=True),
+            sub_datasets=[
+                SubDataset("pine_wm_real2sim_v0_fast/stack_cubes"),
+                SubDataset("pine_wm_real2sim_v0_fast/ring_toss"),
+                SubDataset("pine_wm_real2sim_v0_fast/pour_tea"),
+                SubDataset("pine_wm_real2sim_v0_fast/apples_green_then_red"),
+                SubDataset("pine_wm_real2sim_v0_fast/apples_red_then_green"),
+                SubDataset("pine_wm_real2sim_v0_fast/erase_whiteboard"),
+            ],
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/lustre/fsw/portfolios/coreai/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+        ),
+        num_workers=16,
+        num_train_steps=30_000,
+        save_interval=5000,
         keep_period=None,
         max_to_keep=2,
     ),

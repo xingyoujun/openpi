@@ -1,8 +1,8 @@
 #!/bin/bash
-# Auto-resuming openpi training for the (preemptible) backfill partition.
+# [oci-jhb-slurm-1] Auto-resuming openpi training on batch_long + QoS normal (preemptible after 4h05m, REQUEUE).
 #
-#   sbatch scripts/slurm/train_backfill.sbatch <config-name> <exp-name> [extra train.py args...]
-#   e.g.   sbatch scripts/slurm/train_backfill.sbatch pi05_pine_3task pine3 --num-train-steps=20000
+#   sbatch scripts/slurm/train_jhb.sbatch <config-name> <exp-name> [extra train.py args...]
+#   e.g.   sbatch scripts/slurm/train_jhb.sbatch pi05_pine_3task pine3 --num-train-steps=20000
 #
 # How it survives preemption / the time limit:
 #   * --requeue            : Slurm puts the job back in the queue when it is preempted.
@@ -16,7 +16,7 @@
 #   SAVE_INTERVAL (5000)  NUM_WORKERS (16)  WANDB_MODE (online if a key is found, else offline)  IMAGE  MAX_RESTARTS
 #   wandb key: put it in $LUSTRE/.wandb_api_key (chmod 600) or export WANDB_API_KEY.
 #SBATCH -A coreai_devtech_all
-#SBATCH -p backfill
+#SBATCH -p batch_long
 #SBATCH --qos=normal
 #SBATCH -N 1
 #SBATCH --gpus-per-node=4
