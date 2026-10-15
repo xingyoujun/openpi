@@ -941,6 +941,39 @@ _CONFIGS = [
         keep_period=None,
         max_to_keep=2,
     ),
+    # USDCraft-Data (HF xingyoujun/USDCraft-Data): open_drawer, pour_water, stack_cups. Already exported in the fast
+    # format (224x224, all-intra), so it is used as downloaded.
+    TrainConfig(
+        name="pi05_pine_usdcraft3_fast",
+        project_name="pine_wm",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotPineDataConfig(
+            repo_id="USDCraft-Data/pine_wm",
+            base_config=DataConfig(prompt_from_task=True),
+            sub_datasets=[
+                SubDataset("USDCraft-Data/pine_wm/open_drawer"),
+                SubDataset("USDCraft-Data/pine_wm/pour_water"),
+                SubDataset("USDCraft-Data/pine_wm/stack_cups"),
+            ],
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/lustre/fsw/portfolios/coreai/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+        ),
+        num_workers=16,
+        num_train_steps=30_000,
+        save_interval=5000,
+        keep_period=None,
+        max_to_keep=2,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
