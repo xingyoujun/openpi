@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.pine_piper_policy as pine_piper_policy
 import openpi.policies.pine_policy as pine_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -416,6 +417,54 @@ class LeRobotPineDataConfig(DataConfigFactory):
             outputs=[pine_policy.PineOutputs()],
         )
         delta_action_mask = _transforms.make_bool_mask(9, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action.eef_9d", "action"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPinePiperDataConfig(DataConfigFactory):
+    """Pine Piper dual-arm datasets (USDCraft-Data/pine_piper): both arms' eef_9d + grippers, ego + two wrist cameras.
+
+    State / action are 20-D: [left eef_9d, left gripper, right eef_9d, right gripper]. Actions are absolute, so the eef
+    parts are converted to deltas w.r.t. the current state (the grippers stay absolute).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/ego_image": "observation.images.cam_high",
+                        "observation/left_wrist_image": "observation.images.cam_left_wrist",
+                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+                        "observation/eef_9d": "observation.eef_9d",
+                        "observation/joints": "observation.state",
+                        "actions/eef_9d": "action.eef_9d",
+                        "actions/joints": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[pine_piper_policy.PinePiperInputs(model_type=model_config.model_type)],
+            outputs=[pine_piper_policy.PinePiperOutputs()],
+        )
+        delta_action_mask = _transforms.make_bool_mask(9, -1, 9, -1)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -970,6 +1019,34 @@ _CONFIGS = [
         ),
         num_workers=16,
         num_train_steps=30_000,
+        save_interval=5000,
+        keep_period=None,
+        max_to_keep=2,
+    ),
+    # USDCraft-Data pine_piper (dual-arm): stack_cups. 20-D eef_9d + gripper state/action, ego + two wrist cameras.
+    TrainConfig(
+        name="pi05_pine_piper_stack_cups_fast",
+        project_name="pine_wm",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotPinePiperDataConfig(
+            repo_id="USDCraft-Data/pine_piper",
+            base_config=DataConfig(prompt_from_task=True),
+            sub_datasets=[SubDataset("USDCraft-Data/pine_piper/stack_cups")],
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/lustre/fsw/portfolios/coreai/users/chuanruiz/code/openpi/checkpoints/pi05_base/params"
+        ),
+        num_workers=16,
+        num_train_steps=20_000,
         save_interval=5000,
         keep_period=None,
         max_to_keep=2,
