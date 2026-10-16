@@ -1023,15 +1023,18 @@ _CONFIGS = [
         keep_period=None,
         max_to_keep=2,
     ),
-    # USDCraft-Data pine_piper (dual-arm): stack_cups. 20-D eef_9d + gripper state/action, ego + two wrist cameras.
+    # USDCraft-Data pine_piper (dual-arm): stack_cubes + stack_cups. 20-D eef_9d + gripper state/action, ego + two wrist cameras.
     TrainConfig(
-        name="pi05_pine_piper_stack_cups_fast",
+        name="pi05_pine_piper_fast",
         project_name="pine_wm",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
         data=LeRobotPinePiperDataConfig(
             repo_id="USDCraft-Data/pine_piper",
             base_config=DataConfig(prompt_from_task=True),
-            sub_datasets=[SubDataset("USDCraft-Data/pine_piper/stack_cups")],
+            sub_datasets=[
+                SubDataset("USDCraft-Data/pine_piper/stack_cubes"),
+                SubDataset("USDCraft-Data/pine_piper/stack_cups"),
+            ],
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
